@@ -1,4 +1,4 @@
-use std::cmp::{max, min};
+use std::cmp::{max, min, Ordering};
 use std::sync::{Arc, RwLock};
 
 use cursive::align::HAlign;
@@ -9,19 +9,27 @@ use cursive::view::ScrollBase;
 use cursive::{Cursive, Printer, Rect, Vec2};
 use unicode_width::UnicodeWidthStr;
 
+use crate::album::Album;
+use crate::artist::Artist;
+use crate::command::{Command, GotoMode, JumpMode, MoveAmount, MoveMode, TargetMode};
+use crate::commands::CommandResult;
+use crate::episode::Episode;
+use crate::library::Library;
+use crate::playable::Playable;
+use crate::playlist::Playlist;
+use crate::queue::Queue;
+use crate::show::Show;
+use crate::track::Track;
+use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
+use crate::ui::album::AlbumView;
+use crate::ui::artist::ArtistView;
+use crate::ui::contextmenu::ContextMenu;
 #[cfg(feature = "share_clipboard")]
 use clipboard::{ClipboardContext, ClipboardProvider};
-use command::{Command, GotoMode, MoveMode, TargetMode};
-use commands::CommandResult;
-use library::Library;
-use queue::Queue;
-use track::Track;
-use traits::{IntoBoxedViewExt, ListItem, ViewExt};
-use ui::album::AlbumView;
-use ui::artist::ArtistView;
-use ui::contextmenu::ContextMenu;
+use regex::Regex;
 
 pub type Paginator<I> = Box<dyn Fn(Arc<RwLock<Vec<I>>>) + Send + Sync>;
+
 pub struct Pagination<I: ListItem> {
     max_content: Arc<RwLock<Option<usize>>>,
     callback: Arc<RwLock<Option<Paginator<I>>>>,
@@ -88,6 +96,9 @@ pub struct ListView<I: ListItem> {
     content: Arc<RwLock<Vec<I>>>,
     last_content_len: usize,
     selected: usize,
+    search_query: String,
+    search_indexes: Vec<usize>,
+    search_selected_index: usize,
     last_size: Vec2,
     scrollbar: ScrollBase,
     queue: Arc<Queue>,
@@ -101,6 +112,9 @@ impl<I: ListItem> ListView<I> {
             content,
             last_content_len: 0,
             selected: 0,
+            search_query: String::new(),
+            search_indexes: Vec::new(),
+            search_selected_index: 0,
             last_size: Vec2::new(0, 0),
             scrollbar: ScrollBase::new(),
             queue,
@@ -131,6 +145,20 @@ impl<I: ListItem> ListView<I> {
         self.selected
     }
 
+    pub fn get_indexes_of(&self, query: &str) -> Vec<usize> {
+        let content = self.content.read().unwrap();
+        content
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| {
+                i.display_left()
+                    .to_lowercase()
+                    .contains(&query[..].to_lowercase())
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     pub fn move_focus_to(&mut self, target: usize) {
         let len = self.content.read().unwrap().len().saturating_sub(1);
         self.selected = min(target, len);
@@ -146,13 +174,21 @@ impl<I: ListItem> ListView<I> {
         let content = self.content.read().unwrap();
         let any = &(*content) as &dyn std::any::Any;
         if let Some(tracks) = any.downcast_ref::<Vec<Track>>() {
-            let tracks: Vec<&Track> = tracks.iter().collect();
+            let tracks: Vec<Playable> = tracks
+                .iter()
+                .map(|track| Playable::Track(track.clone()))
+                .collect();
             let index = self.queue.append_next(tracks);
-            self.queue.play(index + self.selected, true);
+            self.queue.play(index + self.selected, true, false);
             true
         } else {
             false
         }
+    }
+
+    pub fn remove(&self, index: usize) {
+        let mut c = self.content.write().unwrap();
+        c.remove(index);
     }
 }
 
@@ -175,7 +211,7 @@ impl<I: ListItem> View for ListView<I> {
 
                 let style = if self.selected == i {
                     let fg = if item.is_playing(self.queue.clone()) {
-                        *printer.theme.palette.custom("playing").unwrap()
+                        *printer.theme.palette.custom("playing_selected").unwrap()
                     } else {
                         PaletteColor::Tertiary.resolve(&printer.theme.palette)
                     };
@@ -193,7 +229,9 @@ impl<I: ListItem> View for ListView<I> {
                 };
 
                 let left = item.display_left();
+                let center = item.display_center(self.library.clone());
                 let right = item.display_right(self.library.clone());
+                let draw_center = !center.is_empty();
 
                 // draw left string
                 printer.with_color(style, |printer| {
@@ -201,13 +239,55 @@ impl<I: ListItem> View for ListView<I> {
                     printer.print((0, 0), &left);
                 });
 
-                // draw ".." to indicate a cut off string
-                let max_length = printer.size.x.saturating_sub(right.width() + 1);
-                if max_length < left.width() {
-                    let offset = max_length.saturating_sub(1);
+                // if line contains search query match, draw on top with
+                // highlight color
+                if self.search_indexes.contains(&i) {
+                    let fg = *printer.theme.palette.custom("search_match").unwrap();
+                    let matched_style = ColorStyle::new(fg, style.back);
+
+                    let matches: Vec<(usize, usize)> = left
+                        .to_lowercase()
+                        .match_indices(&self.search_query)
+                        .map(|i| (i.0, i.0 + i.1.len()))
+                        .collect();
+
+                    for m in matches {
+                        printer.with_color(matched_style, |printer| {
+                            printer.print((m.0, 0), &left[m.0..m.1]);
+                        });
+                    }
+                }
+
+                // left string cut off indicator
+                let center_offset = printer.size.x / 2;
+                let left_max_length = if draw_center {
+                    center_offset.saturating_sub(1)
+                } else {
+                    printer.size.x.saturating_sub(right.width() + 1)
+                };
+
+                if left_max_length < left.width() {
+                    let offset = left_max_length.saturating_sub(1);
                     printer.with_color(style, |printer| {
+                        printer.print_hline((offset, 0), printer.size.x, " ");
                         printer.print((offset, 0), "..");
                     });
+                }
+
+                // draw center string
+                if draw_center {
+                    printer.with_color(style, |printer| {
+                        printer.print((center_offset, 0), &center);
+                    });
+
+                    // center string cut off indicator
+                    let max_length = printer.size.x.saturating_sub(right.width() + 1);
+                    if max_length < center_offset + center.width() {
+                        let offset = max_length.saturating_sub(1);
+                        printer.with_color(style, |printer| {
+                            printer.print((offset, 0), "..");
+                        });
+                    }
                 }
 
                 // draw right string
@@ -313,6 +393,15 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
 
                 return Ok(CommandResult::Consumed(None));
             }
+            Command::PlayNext => {
+                info!("played next");
+                let mut content = self.content.write().unwrap();
+                if let Some(item) = content.get_mut(self.selected) {
+                    item.play_next(self.queue.clone());
+                }
+
+                return Ok(CommandResult::Consumed(None));
+            }
             Command::Queue => {
                 let mut content = self.content.write().unwrap();
                 if let Some(item) = content.get_mut(self.selected) {
@@ -346,7 +435,10 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                     TargetMode::Selected => self.content.read().ok().and_then(|content| {
                         content.get(self.selected).and_then(ListItem::share_url)
                     }),
-                    TargetMode::Current => self.queue.get_current().and_then(|t| t.share_url()),
+                    TargetMode::Current => self
+                        .queue
+                        .get_current()
+                        .and_then(|t| t.as_listitem().share_url()),
                 };
 
                 if let Some(url) = url {
@@ -358,26 +450,67 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
 
                 return Ok(CommandResult::Consumed(None));
             }
+            Command::Jump(mode) => match mode {
+                JumpMode::Query(query) => {
+                    self.search_query = query.to_lowercase();
+                    self.search_indexes = self.get_indexes_of(query);
+                    self.search_selected_index = 0;
+                    match self.search_indexes.get(0) {
+                        Some(&index) => {
+                            self.move_focus_to(index);
+                            return Ok(CommandResult::Consumed(None));
+                        }
+                        None => return Ok(CommandResult::Ignored),
+                    }
+                }
+                JumpMode::Next => {
+                    let len = self.search_indexes.len();
+                    if len == 0 {
+                        return Ok(CommandResult::Ignored);
+                    }
+                    let index = self.search_selected_index;
+                    let next_index = match index.cmp(&(len - 1)) {
+                        Ordering::Equal => 0,
+                        _ => index + 1,
+                    };
+                    self.move_focus_to(self.search_indexes[next_index]);
+                    self.search_selected_index = next_index;
+                    return Ok(CommandResult::Consumed(None));
+                }
+                JumpMode::Previous => {
+                    let len = self.search_indexes.len();
+                    if len == 0 {
+                        return Ok(CommandResult::Ignored);
+                    }
+                    let index = self.search_selected_index;
+                    let prev_index = match index.cmp(&0) {
+                        Ordering::Equal => len - 1,
+                        _ => index - 1,
+                    };
+                    self.move_focus_to(self.search_indexes[prev_index]);
+                    self.search_selected_index = prev_index;
+                    return Ok(CommandResult::Consumed(None));
+                }
+            },
             Command::Move(mode, amount) => {
-                let amount = match amount {
-                    Some(amount) => *amount,
-                    _ => 1,
-                };
-
-                let len = self.content.read().unwrap().len();
+                let last_idx = self.content.read().unwrap().len().saturating_sub(1);
 
                 match mode {
                     MoveMode::Up if self.selected > 0 => {
-                        self.move_focus(-(amount as i32));
+                        match amount {
+                            MoveAmount::Extreme => self.move_focus_to(0),
+                            MoveAmount::Integer(amount) => self.move_focus(-(*amount)),
+                        }
                         return Ok(CommandResult::Consumed(None));
                     }
-                    MoveMode::Down if self.selected < len.saturating_sub(1) => {
-                        self.move_focus(amount as i32);
+                    MoveMode::Down if self.selected < last_idx => {
+                        match amount {
+                            MoveAmount::Extreme => self.move_focus_to(last_idx),
+                            MoveAmount::Integer(amount) => self.move_focus(*amount),
+                        }
                         return Ok(CommandResult::Consumed(None));
                     }
-                    MoveMode::Down
-                        if self.selected == len.saturating_sub(1) && self.can_paginate() =>
-                    {
+                    MoveMode::Down if self.selected == last_idx && self.can_paginate() => {
                         self.pagination.call(&self.content);
                     }
                     _ => {}
@@ -387,14 +520,10 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                 let queue = self.queue.clone();
                 let library = self.library.clone();
                 let target: Option<Box<dyn ListItem>> = match mode {
-                    TargetMode::Current => {
-                        self.queue.get_current().and_then(|t| Some(t.as_listitem()))
-                    }
+                    TargetMode::Current => self.queue.get_current().map(|t| t.as_listitem()),
                     TargetMode::Selected => {
                         let content = self.content.read().unwrap();
-                        content
-                            .get(self.selected)
-                            .and_then(|t| Some(t.as_listitem()))
+                        content.get(self.selected).map(|t| t.as_listitem())
                     }
                 };
 
@@ -433,6 +562,65 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                         }
                     }
                 }
+            }
+            Command::Insert(url) => {
+                let url = match url.as_ref().map(String::as_str) {
+                    #[cfg(feature = "share_clipboard")]
+                    Some("") | None => ClipboardProvider::new()
+                        .and_then(|mut ctx: ClipboardContext| ctx.get_contents())
+                        .ok()
+                        .unwrap(),
+                    Some(url) => url.to_owned(),
+                    // do nothing if clipboard feature is disabled and there is no url provided
+                    #[allow(unreachable_patterns)]
+                    _ => return Ok(CommandResult::Consumed(None)),
+                };
+
+                let spotify = self.queue.get_spotify();
+
+                let re =
+                    Regex::new(r"https?://open\.spotify\.com/(user/[^/]+/)?(\S+)/(\S+)(\?si=\S+)?").unwrap();
+                let captures = re.captures(&url);
+
+                if let Some(captures) = captures {
+                    let target: Option<Box<dyn ListItem>> = match &captures[2] {
+                        "track" => spotify
+                            .track(&captures[3])
+                            .map(|track| Track::from(&track).as_listitem()),
+                        "album" => spotify
+                            .album(&captures[3])
+                            .map(|album| Album::from(&album).as_listitem()),
+                        "playlist" => spotify
+                            .playlist(&captures[3])
+                            .map(|playlist| Playlist::from(&playlist).as_listitem()),
+                        "artist" => spotify
+                            .artist(&captures[3])
+                            .map(|artist| Artist::from(&artist).as_listitem()),
+                        "episode" => spotify
+                            .episode(&captures[3])
+                            .map(|episode| Episode::from(&episode).as_listitem()),
+                        "show" => spotify
+                            .get_show(&captures[3])
+                            .map(|show| Show::from(&show).as_listitem()),
+                        _ => None,
+                    };
+
+                    let queue = self.queue.clone();
+                    let library = self.library.clone();
+                    // if item has a dedicated view, show it; otherwise open the context menu
+                    if let Some(target) = target {
+                        let view = target.open(queue.clone(), library.clone());
+                        return match view {
+                            Some(view) => Ok(CommandResult::View(view)),
+                            None => {
+                                let contextmenu = ContextMenu::new(target.as_ref(), queue, library);
+                                Ok(CommandResult::Modal(Box::new(contextmenu)))
+                            }
+                        };
+                    }
+                }
+
+                return Ok(CommandResult::Consumed(None));
             }
             _ => {}
         };

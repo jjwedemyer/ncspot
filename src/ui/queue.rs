@@ -1,22 +1,22 @@
 use cursive::traits::{Boxable, Identifiable};
-use cursive::view::ViewWrapper;
+use cursive::view::{Margins, ViewWrapper};
 use cursive::views::{Dialog, EditView, ScrollView, SelectView};
 use cursive::Cursive;
 
 use std::cmp::min;
 use std::sync::Arc;
 
-use command::{Command, ShiftMode};
-use commands::CommandResult;
-use library::Library;
-use queue::Queue;
-use track::Track;
-use traits::ViewExt;
-use ui::listview::ListView;
-use ui::modal::Modal;
+use crate::command::{Command, MoveMode, ShiftMode};
+use crate::commands::CommandResult;
+use crate::library::Library;
+use crate::playable::Playable;
+use crate::queue::Queue;
+use crate::traits::ViewExt;
+use crate::ui::listview::ListView;
+use crate::ui::modal::Modal;
 
 pub struct QueueView {
-    list: ListView<Track>,
+    list: ListView<Playable>,
     library: Arc<Library>,
     queue: Arc<Queue>,
 }
@@ -51,12 +51,12 @@ impl QueueView {
                         library.save_playlist(name, &tracks);
                         s.pop_layer();
                     })
-                    .with_id("name")
+                    .with_name("name")
                     .fixed_width(20);
                 let dialog = Dialog::new()
                     .title("Enter name")
                     .dismiss_button("Cancel")
-                    .padding((1, 1, 1, 0))
+                    .padding(Margins::lrtb(1, 1, 1, 0))
                     .content(edit);
                 s.add_layer(Modal::new(dialog));
             }
@@ -78,28 +78,37 @@ impl QueueView {
         let dialog = Dialog::new()
             .title("Create new or overwrite existing playlist?")
             .dismiss_button("Cancel")
-            .padding((1, 1, 1, 0))
+            .padding(Margins::lrtb(1, 1, 1, 0))
             .content(ScrollView::new(list_select));
         Modal::new(dialog)
     }
 }
 
 impl ViewWrapper for QueueView {
-    wrap_impl!(self.list: ListView<Track>);
+    wrap_impl!(self.list: ListView<Playable>);
 }
 
 impl ViewExt for QueueView {
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         match cmd {
             Command::Play => {
-                self.queue.play(self.list.get_selected_index(), true);
+                self.queue.play(self.list.get_selected_index(), true, false);
                 return Ok(CommandResult::Consumed(None));
+            }
+            Command::PlayNext => {
+                return Ok(CommandResult::Ignored);
             }
             Command::Queue => {
                 return Ok(CommandResult::Ignored);
             }
             Command::Delete => {
-                self.queue.remove(self.list.get_selected_index());
+                let selected = self.list.get_selected_index();
+                let len = self.queue.len();
+
+                self.queue.remove(selected);
+                if selected == len.saturating_sub(1) {
+                    self.list.move_focus(-1);
+                }
                 return Ok(CommandResult::Consumed(None));
             }
             Command::Shift(mode, amount) => {
@@ -131,6 +140,11 @@ impl ViewExt for QueueView {
                 let dialog = Self::save_dialog(self.queue.clone(), self.library.clone());
                 s.add_layer(dialog);
                 return Ok(CommandResult::Consumed(None));
+            }
+            Command::Move(MoveMode::Playing, _) => {
+                if let Some(playing) = self.queue.get_current_index() {
+                    self.list.move_focus_to(playing);
+                }
             }
             _ => {}
         }

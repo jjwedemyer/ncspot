@@ -8,9 +8,9 @@ use cursive::vec::Vec2;
 use cursive::Printer;
 use unicode_width::UnicodeWidthStr;
 
-use library::Library;
-use queue::{Queue, RepeatSetting};
-use spotify::{PlayerEvent, Spotify};
+use crate::library::Library;
+use crate::queue::{Queue, RepeatSetting};
+use crate::spotify::{PlayerEvent, Spotify};
 
 pub struct StatusBar {
     queue: Arc<Queue>,
@@ -90,7 +90,11 @@ impl View for StatusBar {
         });
 
         let updating = if !*self.library.is_done.read().unwrap() {
-            if self.use_nerdfont { "\u{f9e5} " } else { "[U] " }
+            if self.use_nerdfont {
+                "\u{f9e5} "
+            } else {
+                "[U] "
+            }
         } else {
             ""
         };
@@ -119,54 +123,63 @@ impl View for StatusBar {
             ""
         };
 
+        let volume = format!(
+            " [{}%]",
+            (self.spotify.volume() as f64 / 65535_f64 * 100.0) as u16
+        );
+
         printer.with_color(style_bar_bg, |printer| {
             printer.print((0, 0), &"┉".repeat(printer.size.x));
         });
 
-        if let Some(ref t) = self.queue.get_current() {
-            let elapsed = self.spotify.get_current_progress();
-            let elapsed_ms = elapsed.as_millis() as u32;
+        let elapsed = self.spotify.get_current_progress();
+        let elapsed_ms = elapsed.as_millis() as u32;
 
-            let formatted_elapsed = format!(
-                "{:02}:{:02}",
-                elapsed.as_secs() / 60,
-                elapsed.as_secs() % 60
-            );
+        let formatted_elapsed = format!(
+            "{:02}:{:02}",
+            elapsed.as_secs() / 60,
+            elapsed.as_secs() % 60
+        );
 
-            let saved = if self.library.is_saved_track(t) {
-                if self.use_nerdfont {
-                    "\u{f62b} "
-                } else {
-                    "✓ "
-                }
-            } else {
-                ""
-            };
+        let playback_duration_status = match self.queue.get_current() {
+            Some(ref t) => format!("{} / {}", formatted_elapsed, t.duration_str()),
+            None => "".to_string(),
+        };
 
-            let right = updating.to_string()
-                + repeat
-                + shuffle
-                + saved
-                + &format!("{} / {} ", formatted_elapsed, t.duration_str());
-            let offset = HAlign::Right.get_offset(right.width(), printer.size.x);
+        let right = updating.to_string()
+            + repeat
+            + shuffle
+            // + saved
+            + &playback_duration_status
+            + &volume;
+        let offset = HAlign::Right.get_offset(right.width(), printer.size.x);
 
-            printer.with_color(style, |printer| {
+        printer.with_color(style, |printer| {
+            if let Some(ref t) = self.queue.get_current() {
                 printer.print((4, 1), &t.to_string());
-                printer.print((offset, 1), &right);
-            });
+            }
+            printer.print((offset, 1), &right);
+        });
 
+        if let Some(t) = self.queue.get_current() {
             printer.with_color(style_bar, |printer| {
-                let duration_width = (((printer.size.x as u32) * elapsed_ms) / t.duration) as usize;
+                let duration_width =
+                    (((printer.size.x as u32) * elapsed_ms) / t.duration()) as usize;
                 printer.print((0, 0), &"━".repeat(duration_width + 1));
             });
-        } else {
-            let right = updating.to_string() + repeat + shuffle;
-            let offset = HAlign::Right.get_offset(right.width(), printer.size.x);
-
-            printer.with_color(style, |printer| {
-                printer.print((offset, 1), &right);
-            });
         }
+
+        // if let Some(Playable::Track(ref t)) = self.queue.get_current() {
+        //     let saved = if self.library.is_saved_track(&Playable::Track(t.clone())) {
+        //         if self.use_nerdfont {
+        //             "\u{f62b} "
+        //         } else {
+        //             "✓ "
+        //         }
+        //     } else {
+        //         ""
+        //     };
+        // }
     }
 
     fn layout(&mut self, size: Vec2) {
@@ -198,9 +211,9 @@ impl View for StatusBar {
                 if event == MouseEvent::Press(MouseButton::Left)
                     || event == MouseEvent::Hold(MouseButton::Left)
                 {
-                    if let Some(ref t) = self.queue.get_current() {
+                    if let Some(playable) = self.queue.get_current() {
                         let f: f32 = position.x as f32 / self.last_size.x as f32;
-                        let new = t.duration as f32 * f;
+                        let new = playable.duration() as f32 * f;
                         self.spotify.seek(new as u32);
                     }
                 }

@@ -1,15 +1,16 @@
 use std::fmt;
 use std::sync::Arc;
 
-use rspotify::spotify::model::artist::{FullArtist, SimplifiedArtist};
+use rspotify::model::artist::{FullArtist, SimplifiedArtist};
 
-use album::Album;
-use library::Library;
-use queue::Queue;
-use spotify::Spotify;
-use track::Track;
-use traits::{IntoBoxedViewExt, ListItem, ViewExt};
-use ui::artist::ArtistView;
+use crate::album::Album;
+use crate::library::Library;
+use crate::playable::Playable;
+use crate::queue::Queue;
+use crate::spotify::Spotify;
+use crate::track::Track;
+use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
+use crate::ui::artist::ArtistView;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Artist {
@@ -125,8 +126,8 @@ impl ListItem for Artist {
                 .read()
                 .unwrap()
                 .iter()
-                .filter(|t| t.id.is_some())
-                .map(|t| t.id.clone().unwrap())
+                .filter(|t| t.id().is_some())
+                .map(|t| t.id().unwrap())
                 .collect();
             let ids: Vec<String> = tracks
                 .iter()
@@ -149,7 +150,7 @@ impl ListItem for Artist {
 
     fn display_right(&self, library: Arc<Library>) -> String {
         let followed = if library.is_followed_artist(self) {
-            if library.use_nerdfont {
+            if library.cfg.values().use_nerdfont.unwrap_or(false) {
                 "\u{f62b} "
             } else {
                 "✓ "
@@ -170,9 +171,23 @@ impl ListItem for Artist {
     fn play(&mut self, queue: Arc<Queue>) {
         self.load_albums(queue.get_spotify());
 
-        if let Some(tracks) = self.tracks() {
+        if let Some(tracks) = self.tracks.as_ref() {
+            let tracks: Vec<Playable> = tracks
+                .iter()
+                .map(|track| Playable::Track(track.clone()))
+                .collect();
             let index = queue.append_next(tracks);
-            queue.play(index, true);
+            queue.play(index, true, true);
+        }
+    }
+
+    fn play_next(&mut self, queue: Arc<Queue>) {
+        self.load_albums(queue.get_spotify());
+
+        if let Some(tracks) = self.tracks.as_ref() {
+            for t in tracks.iter().rev() {
+                queue.insert_after_current(Playable::Track(t.clone()));
+            }
         }
     }
 
@@ -181,7 +196,7 @@ impl ListItem for Artist {
 
         if let Some(tracks) = self.tracks() {
             for t in tracks {
-                queue.append(t);
+                queue.append(Playable::Track(t.clone()));
             }
         }
     }

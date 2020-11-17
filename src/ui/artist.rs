@@ -4,15 +4,15 @@ use std::thread;
 use cursive::view::ViewWrapper;
 use cursive::Cursive;
 
-use artist::Artist;
-use command::Command;
-use commands::CommandResult;
-use library::Library;
-use queue::Queue;
-use track::Track;
-use traits::ViewExt;
-use ui::listview::ListView;
-use ui::tabview::TabView;
+use crate::artist::Artist;
+use crate::command::Command;
+use crate::commands::CommandResult;
+use crate::library::Library;
+use crate::queue::Queue;
+use crate::track::Track;
+use crate::traits::ViewExt;
+use crate::ui::listview::ListView;
+use crate::ui::tabview::TabView;
 
 pub struct ArtistView {
     artist: Artist,
@@ -40,7 +40,7 @@ impl ArtistView {
             let library = library.clone();
             thread::spawn(move || {
                 if let Some(id) = id {
-                    if let Some(tracks) = spotify.artist_top_tracks(id) {
+                    if let Some(tracks) = spotify.artist_top_tracks(&id) {
                         top_tracks.write().unwrap().extend(tracks);
                         library.trigger_redraw();
                     }
@@ -51,7 +51,6 @@ impl ArtistView {
         let related: Arc<RwLock<Vec<Artist>>> = Arc::new(RwLock::new(Vec::new()));
         {
             let related = related.clone();
-            let spotify = spotify.clone();
             let id = artist.id.clone();
             let library = library.clone();
             thread::spawn(move || {
@@ -83,7 +82,7 @@ impl ArtistView {
         tabs.add_tab(
             "top_tracks",
             "Top 10",
-            ListView::new(top_tracks.clone(), queue.clone(), library.clone()),
+            ListView::new(top_tracks, queue.clone(), library.clone()),
         );
 
         tabs.add_tab(
@@ -99,7 +98,7 @@ impl ArtistView {
         tabs.add_tab(
             "related",
             "Related Artists",
-            ListView::new(related.clone(), queue.clone(), library.clone()),
+            ListView::new(related, queue, library),
         );
 
         Self { artist, tabs }

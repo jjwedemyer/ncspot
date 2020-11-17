@@ -2,16 +2,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use command::{Command, GotoMode, MoveMode, SeekDirection, ShiftMode, TargetMode};
+use crate::command::{
+    parse, Command, GotoMode, JumpMode, MoveAmount, MoveMode, SeekDirection, ShiftMode, TargetMode,
+};
+use crate::config::Config;
+use crate::library::Library;
+use crate::queue::{Queue, RepeatSetting};
+use crate::spotify::{Spotify, VOLUME_PERCENT};
+use crate::traits::ViewExt;
+use crate::ui::contextmenu::ContextMenu;
+use crate::ui::help::HelpView;
+use crate::ui::layout::Layout;
+use crate::UserData;
 use cursive::event::{Event, Key};
 use cursive::traits::View;
-use cursive::views::ViewRef;
 use cursive::Cursive;
-use library::Library;
-use queue::{Queue, RepeatSetting};
-use spotify::Spotify;
-use traits::ViewExt;
-use ui::layout::Layout;
+use std::cell::RefCell;
 
 pub enum CommandResult {
     Consumed(Option<String>),
@@ -22,19 +28,50 @@ pub enum CommandResult {
 
 pub struct CommandManager {
     aliases: HashMap<String, String>,
+    bindings: RefCell<HashMap<String, Command>>,
     spotify: Arc<Spotify>,
     queue: Arc<Queue>,
     library: Arc<Library>,
+    config: Arc<Config>,
 }
 
 impl CommandManager {
-    pub fn new(spotify: Arc<Spotify>, queue: Arc<Queue>, library: Arc<Library>) -> CommandManager {
+    pub fn new(
+        spotify: Arc<Spotify>,
+        queue: Arc<Queue>,
+        library: Arc<Library>,
+        config: Arc<Config>,
+    ) -> CommandManager {
+        let bindings = RefCell::new(Self::get_bindings(config.clone()));
         CommandManager {
             aliases: HashMap::new(),
+            bindings,
             spotify,
             queue,
             library,
+            config,
         }
+    }
+
+    pub fn get_bindings(config: Arc<Config>) -> HashMap<String, Command> {
+        let config = config.values();
+        let mut kb = if config.default_keybindings.unwrap_or(true) {
+            Self::default_keybindings()
+        } else {
+            HashMap::new()
+        };
+        let custom_bindings: Option<HashMap<String, String>> = config.keybindings.clone();
+
+        for (key, command) in custom_bindings.unwrap_or_default() {
+            if let Some(command) = parse(&command) {
+                info!("Custom keybinding: {} -> {:?}", key, command);
+                kb.insert(key, command);
+            } else {
+                error!("Invalid command for key {}: {}", key, command);
+            }
+        }
+
+        kb
     }
 
     pub fn register_aliases<S: Into<String>>(&mut self, name: S, aliases: Vec<S>) {
@@ -56,6 +93,7 @@ impl CommandManager {
         cmd: &Command,
     ) -> Result<Option<String>, String> {
         match cmd {
+            Command::Noop => Ok(None),
             Command::Quit => {
                 s.quit();
                 Ok(None)
@@ -110,23 +148,73 @@ impl CommandManager {
                 }
                 Ok(None)
             }
+            Command::VolumeUp(amount) => {
+                let volume = self
+                    .spotify
+                    .volume()
+                    .saturating_add(VOLUME_PERCENT * amount);
+                self.spotify.set_volume(volume);
+                Ok(None)
+            }
+            Command::VolumeDown(amount) => {
+                let volume = self
+                    .spotify
+                    .volume()
+                    .saturating_sub(VOLUME_PERCENT * amount);
+                debug!("vol {}", volume);
+                self.spotify.set_volume(volume);
+                Ok(None)
+            }
+            Command::Help => {
+                let view = Box::new(HelpView::new(self.bindings.borrow().clone()));
+                s.call_on_name("main", move |v: &mut Layout| v.push_view(view));
+                Ok(None)
+            }
+            Command::ReloadConfig => {
+                self.config.reload();
+
+                // update theme
+                let theme = self.config.build_theme();
+                s.set_theme(theme);
+
+                // update bindings
+                self.unregister_keybindings(s);
+                self.bindings
+                    .replace(Self::get_bindings(self.config.clone()));
+                self.register_keybindings(s);
+                Ok(None)
+            }
+            Command::NewPlaylist(name) => {
+                match self.spotify.create_playlist(name, None, None) {
+                    Some(_) => self.library.update_library(),
+                    None => error!("could not create playlist {}", name),
+                }
+                Ok(None)
+            }
             Command::Search(_)
+            | Command::Jump(_)
             | Command::Move(_, _)
             | Command::Shift(_, _)
             | Command::Play
+            | Command::PlayNext
             | Command::Queue
             | Command::Save
             | Command::Delete
             | Command::Back
             | Command::Open(_)
+            | Command::Insert(_)
             | Command::Goto(_) => Ok(None),
             _ => Err("Unknown Command".into()),
         }
     }
 
     fn handle_callbacks(&self, s: &mut Cursive, cmd: &Command) -> Result<Option<String>, String> {
-        let local = {
-            let mut main: ViewRef<Layout> = s.find_id("main").unwrap();
+        let local = if let Some(mut contextmenu) = s.find_name::<ContextMenu>("contextmenu") {
+            contextmenu.on_command(s, cmd)?
+        } else {
+            let mut main = s
+                .find_name::<Layout>("main")
+                .expect("could not find layout");
             main.on_command(s, cmd)?
         };
 
@@ -136,7 +224,7 @@ impl CommandManager {
             s.add_layer(modal);
             Ok(None)
         } else if let CommandResult::View(view) = local {
-            s.call_on_id("main", move |v: &mut Layout| {
+            s.call_on_name("main", move |v: &mut Layout| {
                 v.push_view(view);
             });
 
@@ -149,7 +237,7 @@ impl CommandManager {
     pub fn handle(&self, s: &mut Cursive, cmd: Command) {
         let result = self.handle_callbacks(s, &cmd);
 
-        s.call_on_id("main", |v: &mut Layout| {
+        s.call_on_name("main", |v: &mut Layout| {
             v.set_result(result);
         });
 
@@ -157,27 +245,34 @@ impl CommandManager {
     }
 
     pub fn register_keybinding<E: Into<cursive::event::Event>>(
-        this: Arc<Self>,
+        &self,
         cursive: &mut Cursive,
         event: E,
         command: Command,
     ) {
         cursive.add_global_callback(event, move |s| {
-            this.handle(s, command.clone());
+            if let Some(data) = s.user_data::<UserData>().cloned() {
+                data.cmd.handle(s, command.clone());
+            }
         });
     }
 
-    pub fn register_keybindings(
-        this: Arc<Self>,
-        cursive: &mut Cursive,
-        keybindings: Option<HashMap<String, Command>>,
-    ) {
-        let mut kb = Self::default_keybindings();
-        kb.extend(keybindings.unwrap_or_default());
+    pub fn unregister_keybindings(&self, cursive: &mut Cursive) {
+        let kb = self.bindings.borrow();
 
-        for (k, v) in kb {
+        for (k, _v) in kb.iter() {
             if let Some(binding) = Self::parse_keybinding(&k) {
-                Self::register_keybinding(this.clone(), cursive, binding, v);
+                cursive.clear_global_callbacks(binding);
+            }
+        }
+    }
+
+    pub fn register_keybindings(&self, cursive: &mut Cursive) {
+        let kb = self.bindings.borrow();
+
+        for (k, v) in kb.iter() {
+            if let Some(binding) = Self::parse_keybinding(&k) {
+                self.register_keybinding(cursive, binding, v.clone());
             } else {
                 error!("Could not parse keybinding: \"{}\"", &k);
             }
@@ -194,14 +289,29 @@ impl CommandManager {
         kb.insert("<".into(), Command::Previous);
         kb.insert(">".into(), Command::Next);
         kb.insert("c".into(), Command::Clear);
-        kb.insert(" ".into(), Command::Queue);
+        kb.insert("Space".into(), Command::Queue);
+        kb.insert(".".into(), Command::PlayNext);
         kb.insert("Enter".into(), Command::Play);
+        kb.insert("n".into(), Command::Jump(JumpMode::Next));
+        kb.insert("Shift+n".into(), Command::Jump(JumpMode::Previous));
         kb.insert("s".into(), Command::Save);
         kb.insert("Ctrl+s".into(), Command::SaveQueue);
         kb.insert("d".into(), Command::Delete);
-        kb.insert("/".into(), Command::Focus("search".into()));
-        kb.insert(".".into(), Command::Seek(SeekDirection::Relative(500)));
-        kb.insert(",".into(), Command::Seek(SeekDirection::Relative(-500)));
+        kb.insert("f".into(), Command::Seek(SeekDirection::Relative(1000)));
+        kb.insert("b".into(), Command::Seek(SeekDirection::Relative(-1000)));
+        kb.insert(
+            "Shift+f".into(),
+            Command::Seek(SeekDirection::Relative(10000)),
+        );
+        kb.insert(
+            "Shift+b".into(),
+            Command::Seek(SeekDirection::Relative(-10000)),
+        );
+        kb.insert("+".into(), Command::VolumeUp(1));
+        kb.insert("]".into(), Command::VolumeUp(5));
+        kb.insert("-".into(), Command::VolumeDown(1));
+        kb.insert("[".into(), Command::VolumeDown(5));
+
         kb.insert("r".into(), Command::Repeat(None));
         kb.insert("z".into(), Command::Shuffle(None));
         kb.insert("x".into(), Command::Share(TargetMode::Current));
@@ -210,6 +320,7 @@ impl CommandManager {
         kb.insert("F1".into(), Command::Focus("queue".into()));
         kb.insert("F2".into(), Command::Focus("search".into()));
         kb.insert("F3".into(), Command::Focus("library".into()));
+        kb.insert("?".into(), Command::Help);
         kb.insert("Backspace".into(), Command::Back);
 
         kb.insert("o".into(), Command::Open(TargetMode::Selected));
@@ -217,24 +328,73 @@ impl CommandManager {
         kb.insert("a".into(), Command::Goto(GotoMode::Album));
         kb.insert("A".into(), Command::Goto(GotoMode::Artist));
 
-        kb.insert("Up".into(), Command::Move(MoveMode::Up, None));
-        kb.insert("Down".into(), Command::Move(MoveMode::Down, None));
-        kb.insert("Left".into(), Command::Move(MoveMode::Left, None));
-        kb.insert("Right".into(), Command::Move(MoveMode::Right, None));
-        kb.insert("PageUp".into(), Command::Move(MoveMode::Up, Some(5)));
-        kb.insert("PageDown".into(), Command::Move(MoveMode::Down, Some(5)));
-        kb.insert("k".into(), Command::Move(MoveMode::Up, None));
-        kb.insert("j".into(), Command::Move(MoveMode::Down, None));
-        kb.insert("h".into(), Command::Move(MoveMode::Left, None));
-        kb.insert("l".into(), Command::Move(MoveMode::Right, None));
+        kb.insert("Up".into(), Command::Move(MoveMode::Up, Default::default()));
+        kb.insert(
+            "p".into(),
+            Command::Move(MoveMode::Playing, Default::default()),
+        );
+        kb.insert(
+            "Down".into(),
+            Command::Move(MoveMode::Down, Default::default()),
+        );
+        kb.insert(
+            "Left".into(),
+            Command::Move(MoveMode::Left, Default::default()),
+        );
+        kb.insert(
+            "Right".into(),
+            Command::Move(MoveMode::Right, Default::default()),
+        );
+        kb.insert(
+            "PageUp".into(),
+            Command::Move(MoveMode::Up, MoveAmount::Integer(5)),
+        );
+        kb.insert(
+            "PageDown".into(),
+            Command::Move(MoveMode::Down, MoveAmount::Integer(5)),
+        );
+        kb.insert(
+            "Home".into(),
+            Command::Move(MoveMode::Up, MoveAmount::Extreme),
+        );
+        kb.insert(
+            "End".into(),
+            Command::Move(MoveMode::Down, MoveAmount::Extreme),
+        );
+        kb.insert("k".into(), Command::Move(MoveMode::Up, Default::default()));
+        kb.insert(
+            "j".into(),
+            Command::Move(MoveMode::Down, Default::default()),
+        );
+        kb.insert(
+            "h".into(),
+            Command::Move(MoveMode::Left, Default::default()),
+        );
+        kb.insert(
+            "l".into(),
+            Command::Move(MoveMode::Right, Default::default()),
+        );
 
-        kb.insert("Ctrl+p".into(), Command::Move(MoveMode::Up, None));
-        kb.insert("Ctrl+n".into(), Command::Move(MoveMode::Down, None));
-        kb.insert("Ctrl+a".into(), Command::Move(MoveMode::Left, None));
-        kb.insert("Ctrl+e".into(), Command::Move(MoveMode::Right, None));
+        kb.insert(
+            "Ctrl+p".into(),
+            Command::Move(MoveMode::Up, Default::default()),
+        );
+        kb.insert(
+            "Ctrl+n".into(),
+            Command::Move(MoveMode::Down, Default::default()),
+        );
+        kb.insert(
+            "Ctrl+a".into(),
+            Command::Move(MoveMode::Left, Default::default()),
+        );
+        kb.insert(
+            "Ctrl+e".into(),
+            Command::Move(MoveMode::Right, Default::default()),
+        );
 
         kb.insert("Shift+Up".into(), Command::Shift(ShiftMode::Up, None));
         kb.insert("Shift+Down".into(), Command::Shift(ShiftMode::Down, None));
+        kb.insert("Ctrl+v".into(), Command::Insert(None));
 
         kb
     }
@@ -242,6 +402,7 @@ impl CommandManager {
     fn parse_key(key: &str) -> Event {
         match key {
             "Enter" => Event::Key(Key::Enter),
+            "Space" => Event::Char(" ".chars().next().unwrap()),
             "Tab" => Event::Key(Key::Tab),
             "Backspace" => Event::Key(Key::Backspace),
             "Esc" => Event::Key(Key::Esc),
@@ -276,7 +437,7 @@ impl CommandManager {
 
     fn parse_keybinding(kb: &str) -> Option<cursive::event::Event> {
         let mut split = kb.split('+');
-        if split.clone().count() == 2 {
+        if kb != "+" && split.clone().count() == 2 {
             let modifier = split.next().unwrap();
             let key = split.next().unwrap();
             let parsed = Self::parse_key(key);

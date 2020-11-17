@@ -3,19 +3,19 @@ use std::path::Path;
 use cursive::traits::Boxable;
 use cursive::view::Identifiable;
 use cursive::views::*;
-use cursive::{CbSink, Cursive};
+use cursive::{CbSink, Cursive, CursiveExt};
 
 use librespot_core::authentication::Credentials as RespotCredentials;
 use librespot_protocol::authentication::AuthenticationType;
 
 pub fn create_credentials(path: &Path) -> Result<RespotCredentials, String> {
     let mut login_cursive = Cursive::default();
-    let mut info_buf = TextContent::new("Failed to authenticate\n");
+    let info_buf = TextContent::new("Failed to authenticate\n");
     info_buf.append(format!(
         "Cannot read config file from {}\n",
         path.to_str().unwrap()
     ));
-    let info_view = Dialog::around(TextView::new_with_content(info_buf.clone()))
+    let info_view = Dialog::around(TextView::new_with_content(info_buf))
         .button("Login", move |s| {
             let login_view = Dialog::new()
                 .title("Spotify login")
@@ -23,23 +23,23 @@ pub fn create_credentials(path: &Path) -> Result<RespotCredentials, String> {
                     ListView::new()
                         .child(
                             "Username",
-                            EditView::new().with_id("spotify_user").fixed_width(18),
+                            EditView::new().with_name("spotify_user").fixed_width(18),
                         )
                         .child(
                             "Password",
                             EditView::new()
                                 .secret()
-                                .with_id("spotify_password")
+                                .with_name("spotify_password")
                                 .fixed_width(18),
                         ),
                 )
                 .button("Login", |s| {
                     let username = s
-                        .call_on_id("spotify_user", |view: &mut EditView| view.get_content())
+                        .call_on_name("spotify_user", |view: &mut EditView| view.get_content())
                         .unwrap()
                         .to_string();
                     let auth_data = s
-                        .call_on_id("spotify_password", |view: &mut EditView| view.get_content())
+                        .call_on_name("spotify_password", |view: &mut EditView| view.get_content())
                         .unwrap()
                         .to_string()
                         .as_bytes()

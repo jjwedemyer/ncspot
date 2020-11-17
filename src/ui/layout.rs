@@ -12,10 +12,10 @@ use cursive::views::EditView;
 use cursive::{Cursive, Printer};
 use unicode_width::UnicodeWidthStr;
 
-use command::Command;
-use commands::CommandResult;
-use events;
-use traits::{IntoBoxedViewExt, ViewExt};
+use crate::command::Command;
+use crate::commands::CommandResult;
+use crate::events;
+use crate::traits::{IntoBoxedViewExt, ViewExt};
 
 struct Screen {
     title: String,
@@ -63,6 +63,13 @@ impl Layout {
     pub fn enable_cmdline(&mut self) {
         if !self.cmdline_focus {
             self.cmdline.set_content(":");
+            self.cmdline_focus = true;
+        }
+    }
+
+    pub fn enable_jump(&mut self) {
+        if !self.cmdline_focus {
+            self.cmdline.set_content("/");
             self.cmdline_focus = true;
         }
     }
@@ -242,7 +249,7 @@ impl View for Layout {
             if position.y < self.last_size.y.saturating_sub(2 + cmdline_height) {
                 if let Some(ref id) = self.focus {
                     let screen = self.views.get_mut(id).unwrap();
-                    screen.view.on_event(event.clone());
+                    screen.view.on_event(event);
                 }
             } else if position.y < self.last_size.y - cmdline_height {
                 self.statusbar.on_event(

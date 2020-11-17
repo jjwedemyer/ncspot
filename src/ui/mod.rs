@@ -1,6 +1,7 @@
 pub mod album;
 pub mod artist;
 pub mod contextmenu;
+pub mod help;
 pub mod layout;
 pub mod library;
 pub mod listview;
@@ -9,5 +10,6 @@ pub mod playlist;
 pub mod playlists;
 pub mod queue;
 pub mod search;
+pub mod show;
 pub mod statusbar;
 pub mod tabview;

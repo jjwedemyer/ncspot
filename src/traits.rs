@@ -1,27 +1,38 @@
 use std::sync::Arc;
 
 use cursive::view::{View, ViewWrapper};
-use cursive::views::IdView;
+use cursive::views::NamedView;
 use cursive::Cursive;
 
-use album::Album;
-use artist::Artist;
-use command::Command;
-use commands::CommandResult;
-use library::Library;
-use queue::Queue;
-use track::Track;
+use crate::album::Album;
+use crate::artist::Artist;
+use crate::command::Command;
+use crate::commands::CommandResult;
+use crate::library::Library;
+use crate::queue::Queue;
+use crate::track::Track;
 
 pub trait ListItem: Sync + Send + 'static {
     fn is_playing(&self, queue: Arc<Queue>) -> bool;
     fn display_left(&self) -> String;
+    fn display_center(&self, _library: Arc<Library>) -> String {
+        "".to_string()
+    }
     fn display_right(&self, library: Arc<Library>) -> String;
     fn play(&mut self, queue: Arc<Queue>);
     fn queue(&mut self, queue: Arc<Queue>);
+    fn play_next(&mut self, queue: Arc<Queue>);
     fn toggle_saved(&mut self, library: Arc<Library>);
     fn save(&mut self, library: Arc<Library>);
     fn unsave(&mut self, library: Arc<Library>);
     fn open(&self, queue: Arc<Queue>, library: Arc<Library>) -> Option<Box<dyn ViewExt>>;
+    fn open_recommentations(
+        &self,
+        _queue: Arc<Queue>,
+        _library: Arc<Library>,
+    ) -> Option<Box<dyn ViewExt>> {
+        None
+    }
     fn share_url(&self) -> Option<String>;
 
     fn album(&self, _queue: Arc<Queue>) -> Option<Album> {
@@ -49,7 +60,7 @@ pub trait ViewExt: View {
     }
 }
 
-impl<V: ViewExt> ViewExt for IdView<V> {
+impl<V: ViewExt> ViewExt for NamedView<V> {
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         self.with_view_mut(move |v| v.on_command(s, cmd)).unwrap()
     }

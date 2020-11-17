@@ -4,7 +4,6 @@ extern crate crossbeam_channel;
 extern crate cursive;
 #[cfg(feature = "share_clipboard")]
 extern crate clipboard;
-extern crate directories;
 extern crate failure;
 extern crate futures;
 #[macro_use]
@@ -13,14 +12,10 @@ extern crate librespot_core;
 extern crate librespot_playback;
 extern crate librespot_protocol;
 extern crate rspotify;
-extern crate tokio;
 extern crate tokio_core;
 extern crate tokio_timer;
 extern crate unicode_width;
 extern crate webbrowser;
-
-#[cfg(feature = "mpris")]
-extern crate dbus;
 
 #[macro_use]
 extern crate serde;
@@ -35,6 +30,11 @@ extern crate fern;
 extern crate rand;
 extern crate url;
 
+extern crate strum;
+extern crate strum_macros;
+
+extern crate regex;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -43,9 +43,12 @@ use std::sync::Arc;
 
 use clap::{App, Arg};
 use cursive::traits::Identifiable;
-use cursive::Cursive;
+use cursive::{Cursive, CursiveExt};
+use std::ffi::CString;
 
 use librespot_core::authentication::Credentials;
+use librespot_core::cache::Cache;
+use librespot_playback::audio_backend;
 
 mod album;
 mod artist;
@@ -53,10 +56,13 @@ mod authentication;
 mod command;
 mod commands;
 mod config;
+mod episode;
 mod events;
 mod library;
+mod playable;
 mod playlist;
 mod queue;
+mod show;
 mod spotify;
 mod theme;
 mod track;
@@ -66,10 +72,13 @@ mod ui;
 #[cfg(feature = "mpris")]
 mod mpris;
 
-use commands::CommandManager;
-use events::{Event, EventManager};
-use library::Library;
-use spotify::PlayerEvent;
+use crate::command::{Command, JumpMode};
+use crate::commands::CommandManager;
+use crate::config::Config;
+use crate::events::{Event, EventManager};
+use crate::library::Library;
+use crate::spotify::PlayerEvent;
+use crate::ui::contextmenu::ContextMenu;
 
 fn setup_logging(filename: &str) -> Result<(), fern::InitError> {
     fern::Dispatch::new()
@@ -94,17 +103,29 @@ fn setup_logging(filename: &str) -> Result<(), fern::InitError> {
     Ok(())
 }
 
-fn get_credentials(reset: bool) -> Credentials {
+fn credentials_prompt(reset: bool, error_message: Option<String>) -> Credentials {
     let path = config::config_path("credentials.toml");
     if reset && fs::remove_file(&path).is_err() {
         error!("could not delete credential file");
     }
 
-    let creds = ::config::load_or_generate_default(&path, authentication::create_credentials, true)
-        .unwrap_or_else(|e| {
-            eprintln!("{}", e);
-            process::exit(1);
-        });
+    if let Some(message) = error_message {
+        let mut siv = cursive::default();
+        let dialog = cursive::views::Dialog::around(cursive::views::TextView::new(format!(
+            "Connection error:\n{}",
+            message
+        )))
+        .button("Ok", |s| s.quit());
+        siv.add_layer(dialog);
+        siv.run();
+    }
+
+    let creds =
+        crate::config::load_or_generate_default(&path, authentication::create_credentials, true)
+            .unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                process::exit(1);
+            });
 
     #[cfg(target_family = "unix")]
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
@@ -116,11 +137,24 @@ fn get_credentials(reset: bool) -> Credentials {
     creds
 }
 
+type UserData = Arc<UserDataInner>;
+struct UserDataInner {
+    pub cmd: CommandManager,
+}
+
 fn main() {
+    let buf = CString::new("").unwrap();
+    unsafe { libc::setlocale(libc::LC_ALL, buf.as_ptr()) };
+
+    let backends = {
+        let backends: Vec<&str> = audio_backend::BACKENDS.iter().map(|b| b.0).collect();
+        format!("Audio backends: {}", backends.join(", "))
+    };
     let matches = App::new("ncspot")
         .version(env!("CARGO_PKG_VERSION"))
         .author("Henrik Friedrichsen <henrik@affekt.org> and contributors")
         .about("cross-platform ncurses Spotify client")
+        .after_help(&*backends)
         .arg(
             Arg::with_name("debug")
                 .short("d")
@@ -153,54 +187,63 @@ fn main() {
 
     // Things here may cause the process to abort; we must do them before creating curses windows
     // otherwise the error message will not be seen by a user
-    let cfg: ::config::Config = {
-        let path = config::config_path("config.toml");
-        ::config::load_or_generate_default(path, |_| Ok(::config::Config::default()), false)
-            .unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                process::exit(1);
-            })
+    let cfg: Arc<crate::config::Config> = Arc::new(Config::new());
+
+    let cache = Cache::new(config::cache_path("librespot"), true);
+    let mut credentials = {
+        let cached_credentials = cache.credentials();
+        match cached_credentials {
+            Some(c) => {
+                info!("Using cached credentials");
+                c
+            }
+            None => credentials_prompt(false, None),
+        }
     };
 
-    let mut credentials = get_credentials(false);
-
-    while !spotify::Spotify::test_credentials(cfg.clone(), credentials.clone()) {
-        credentials = get_credentials(true);
+    while let Err(error) = spotify::Spotify::test_credentials(credentials.clone()) {
+        let reset = error
+            .get_ref()
+            .map_or(false, |err| err.to_string().contains("BadCredentials"));
+        debug!("credential reset: {:?}", reset);
+        let error_msg = match error.get_ref() {
+            Some(inner) => inner.to_string(),
+            None => error.to_string(),
+        };
+        credentials = credentials_prompt(reset, Some(error_msg));
     }
 
-    let theme = theme::load(&cfg);
-
     let mut cursive = Cursive::default();
+    let theme = cfg.build_theme();
     cursive.set_theme(theme.clone());
 
     let event_manager = EventManager::new(cursive.cb_sink().clone());
 
     let spotify = Arc::new(spotify::Spotify::new(
-        cfg.clone(),
         event_manager.clone(),
         credentials,
+        cfg.clone(),
     ));
 
-    let queue = Arc::new(queue::Queue::new(spotify.clone()));
+    let queue = Arc::new(queue::Queue::new(spotify.clone(), cfg.clone()));
 
     #[cfg(feature = "mpris")]
-    let mpris_manager = Arc::new(mpris::MprisManager::new(spotify.clone(), queue.clone()));
-
-    let library = Arc::new(Library::new(
-        &event_manager,
+    let mpris_manager = Arc::new(mpris::MprisManager::new(
+        event_manager.clone(),
         spotify.clone(),
-        cfg.use_nerdfont.unwrap_or(false),
+        queue.clone(),
     ));
 
-    let mut cmd_manager = CommandManager::new(spotify.clone(), queue.clone(), library.clone());
-    cmd_manager.register_all();
+    let library = Arc::new(Library::new(&event_manager, spotify.clone(), cfg.clone()));
 
-    let cmd_manager = Arc::new(cmd_manager);
-    CommandManager::register_keybindings(
-        cmd_manager.clone(),
-        &mut cursive,
-        cfg.keybindings.clone(),
-    );
+    let mut cmd_manager =
+        CommandManager::new(spotify.clone(), queue.clone(), library.clone(), cfg.clone());
+
+    cmd_manager.register_all();
+    cmd_manager.register_keybindings(&mut cursive);
+
+    let user_data: UserData = Arc::new(UserDataInner { cmd: cmd_manager });
+    cursive.set_user_data(user_data);
 
     let search = ui::search::SearchView::new(
         event_manager.clone(),
@@ -215,26 +258,44 @@ fn main() {
 
     let status = ui::statusbar::StatusBar::new(
         queue.clone(),
-        library.clone(),
-        cfg.use_nerdfont.unwrap_or(false),
+        library,
+        cfg.values().use_nerdfont.unwrap_or(false),
     );
 
     let mut layout = ui::layout::Layout::new(status, &event_manager, theme)
-        .view("search", search.with_id("search"), "Search")
-        .view("library", libraryview.with_id("library"), "Library")
+        .view("search", search.with_name("search"), "Search")
+        .view("library", libraryview.with_name("library"), "Library")
         .view("queue", queueview, "Queue");
 
     // initial view is library
     layout.set_view("library");
 
     cursive.add_global_callback(':', move |s| {
-        s.call_on_id("main", |v: &mut ui::layout::Layout| {
-            v.enable_cmdline();
-        });
+        if s.find_name::<ContextMenu>("contextmenu").is_none() {
+            s.call_on_name("main", |v: &mut ui::layout::Layout| {
+                v.enable_cmdline();
+            });
+        }
+    });
+
+    cursive.add_global_callback('/', move |s| {
+        if s.find_name::<ContextMenu>("contextmenu").is_none() {
+            s.call_on_name("main", |v: &mut ui::layout::Layout| {
+                v.enable_jump();
+            });
+        }
+    });
+
+    cursive.add_global_callback(cursive::event::Key::Esc, move |s| {
+        if s.find_name::<ContextMenu>("contextmenu").is_none() {
+            s.call_on_name("main", |v: &mut ui::layout::Layout| {
+                v.clear_cmdline();
+            });
+        }
     });
 
     layout.cmdline.set_on_edit(move |s, cmd, _| {
-        s.call_on_id("main", |v: &mut ui::layout::Layout| {
+        s.call_on_name("main", |v: &mut ui::layout::Layout| {
             if cmd.is_empty() {
                 v.clear_cmdline();
             }
@@ -243,22 +304,31 @@ fn main() {
 
     {
         let ev = event_manager.clone();
-        let cmd_manager = cmd_manager.clone();
         layout.cmdline.set_on_submit(move |s, cmd| {
             {
-                let mut main = s.find_id::<ui::layout::Layout>("main").unwrap();
+                let mut main = s.find_name::<ui::layout::Layout>("main").unwrap();
                 main.clear_cmdline();
             }
-            let c = &cmd[1..];
-            let parsed = command::parse(c);
-            if let Some(parsed) = parsed {
-                cmd_manager.handle(s, parsed);
+            if cmd.starts_with('/') {
+                let query = &cmd[1..];
+                let command = Command::Jump(JumpMode::Query(query.to_string()));
+                if let Some(data) = s.user_data::<UserData>().cloned() {
+                    data.cmd.handle(s, command);
+                }
+            } else {
+                let c = &cmd[1..];
+                let parsed = command::parse(c);
+                if let Some(parsed) = parsed {
+                    if let Some(data) = s.user_data::<UserData>().cloned() {
+                        data.cmd.handle(s, parsed)
+                    }
+                }
             }
             ev.trigger();
         });
     }
 
-    cursive.add_fullscreen_layer(layout.with_id("main"));
+    cursive.add_fullscreen_layer(layout.with_name("main"));
 
     // cursive event loop
     while cursive.is_running() {
@@ -276,6 +346,7 @@ fn main() {
                         queue.next(false);
                     }
                 }
+                Event::SessionDied => spotify.start_worker(None),
             }
         }
     }

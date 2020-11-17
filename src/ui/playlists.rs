@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
-use cursive::view::ViewWrapper;
+use cursive::view::{Margins, ViewWrapper};
 use cursive::views::Dialog;
 use cursive::Cursive;
 
-use command::Command;
-use commands::CommandResult;
-use library::Library;
-use playlist::Playlist;
-use queue::Queue;
-use traits::ViewExt;
-use ui::listview::ListView;
-use ui::modal::Modal;
+use crate::command::Command;
+use crate::commands::CommandResult;
+use crate::library::Library;
+use crate::playlist::Playlist;
+use crate::queue::Queue;
+use crate::traits::ViewExt;
+use crate::ui::listview::ListView;
+use crate::ui::modal::Modal;
 
 pub struct PlaylistsView {
     list: ListView<Playlist>,
@@ -21,7 +21,7 @@ pub struct PlaylistsView {
 impl PlaylistsView {
     pub fn new(queue: Arc<Queue>, library: Arc<Library>) -> Self {
         Self {
-            list: ListView::new(library.playlists.clone(), queue.clone(), library.clone()),
+            list: ListView::new(library.playlists.clone(), queue, library.clone()),
             library,
         }
     }
@@ -34,7 +34,7 @@ impl PlaylistsView {
             let library = self.library.clone();
             let id = playlist.id.clone();
             let dialog = Dialog::text("Are you sure you want to delete this playlist?")
-                .padding((1, 1, 1, 0))
+                .padding(Margins::lrtb(1, 1, 1, 0))
                 .title("Delete playlist")
                 .dismiss_button("No")
                 .button("Yes", move |s: &mut Cursive| {

@@ -1,14 +1,15 @@
 use std::iter::Iterator;
 use std::sync::Arc;
 
-use rspotify::spotify::model::playlist::{FullPlaylist, SimplifiedPlaylist};
+use rspotify::model::playlist::{FullPlaylist, SimplifiedPlaylist};
 
-use library::Library;
-use queue::Queue;
-use spotify::Spotify;
-use track::Track;
-use traits::{IntoBoxedViewExt, ListItem, ViewExt};
-use ui::playlist::PlaylistView;
+use crate::library::Library;
+use crate::playable::Playable;
+use crate::queue::Queue;
+use crate::spotify::Spotify;
+use crate::track::Track;
+use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
+use crate::ui::playlist::PlaylistView;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Playlist {
@@ -26,12 +27,18 @@ impl Playlist {
             return;
         }
 
+        self.tracks = Some(self.get_all_tracks(spotify));
+    }
+
+    fn get_all_tracks(&self, spotify: Arc<Spotify>) -> Vec<Track> {
         let mut collected_tracks = Vec::new();
 
         let mut tracks_result = spotify.user_playlist_tracks(&self.id, 100, 0);
         while let Some(ref tracks) = tracks_result.clone() {
             for listtrack in &tracks.items {
-                collected_tracks.push((&listtrack.track).into());
+                if let Some(track) = &listtrack.track {
+                    collected_tracks.push(track.into());
+                }
             }
             debug!("got {} tracks", tracks.items.len());
 
@@ -49,7 +56,58 @@ impl Playlist {
             }
         }
 
-        self.tracks = Some(collected_tracks);
+        collected_tracks
+    }
+
+    pub fn has_track(&self, track_id: &str) -> bool {
+        self.tracks.as_ref().map_or(false, |tracks| {
+            tracks
+                .iter()
+                .any(|track| track.id == Some(track_id.to_string()))
+        })
+    }
+
+    pub fn delete_tracks(
+        &mut self,
+        track_pos_pairs: &[(Track, usize)],
+        spotify: Arc<Spotify>,
+        library: Arc<Library>,
+    ) {
+        if spotify.delete_tracks(&self.id, track_pos_pairs) {
+            if let Some(tracks) = &mut self.tracks {
+                for (_track, pos) in track_pos_pairs {
+                    tracks.remove(*pos);
+                }
+                library.playlist_update(&self);
+            }
+        }
+    }
+
+    pub fn append_tracks(
+        &mut self,
+        new_tracks: &[Track],
+        spotify: Arc<Spotify>,
+        library: Arc<Library>,
+    ) {
+        let track_ids: Vec<String> = new_tracks
+            .to_vec()
+            .iter()
+            .filter(|t| t.id.is_some())
+            .map(|t| t.id.clone().unwrap())
+            .collect();
+
+        let mut has_modified = false;
+
+        if spotify.append_tracks(&self.id, &track_ids, None) {
+            if let Some(tracks) = &mut self.tracks {
+                tracks.append(&mut new_tracks.to_vec());
+                has_modified = true;
+            }
+        }
+
+        if has_modified {
+            library.playlist_update(self);
+        }
     }
 }
 
@@ -93,8 +151,8 @@ impl ListItem for Playlist {
                 .read()
                 .unwrap()
                 .iter()
-                .filter(|t| t.id.is_some())
-                .map(|t| t.id.clone().unwrap())
+                .filter(|t| t.id().is_some())
+                .map(|t| t.id().unwrap())
                 .collect();
             let ids: Vec<String> = tracks
                 .iter()
@@ -116,8 +174,8 @@ impl ListItem for Playlist {
     }
 
     fn display_right(&self, library: Arc<Library>) -> String {
-        let followed = if library.is_followed_playlist(self) {
-            if library.use_nerdfont {
+        let saved = if library.is_saved_playlist(self) {
+            if library.cfg.values().use_nerdfont.unwrap_or(false) {
                 "\u{f62b} "
             } else {
                 "✓ "
@@ -132,15 +190,29 @@ impl ListItem for Playlist {
             .map(|t| t.len())
             .unwrap_or(self.num_tracks);
 
-        format!("{}{:>4} tracks", followed, num_tracks)
+        format!("{}{:>4} tracks", saved, num_tracks)
     }
 
     fn play(&mut self, queue: Arc<Queue>) {
         self.load_tracks(queue.get_spotify());
 
+        if let Some(tracks) = &self.tracks {
+            let tracks: Vec<Playable> = tracks
+                .iter()
+                .map(|track| Playable::Track(track.clone()))
+                .collect();
+            let index = queue.append_next(tracks);
+            queue.play(index, true, true);
+        }
+    }
+
+    fn play_next(&mut self, queue: Arc<Queue>) {
+        self.load_tracks(queue.get_spotify());
+
         if let Some(tracks) = self.tracks.as_ref() {
-            let index = queue.append_next(tracks.iter().collect());
-            queue.play(index, true);
+            for track in tracks.iter().rev() {
+                queue.insert_after_current(Playable::Track(track.clone()));
+            }
         }
     }
 
@@ -149,7 +221,7 @@ impl ListItem for Playlist {
 
         if let Some(tracks) = self.tracks.as_ref() {
             for track in tracks.iter() {
-                queue.append(track);
+                queue.append(Playable::Track(track.clone()));
             }
         }
     }
